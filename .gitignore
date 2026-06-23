@@ -1,5 +1,6 @@
 # Real personal health data
 data/raw/
+outputs/
 *.csv
 
 # Allow synthetic or anonymized sample data
