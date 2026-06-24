@@ -11,6 +11,8 @@ LOW_THRESHOLD = 70
 HIGH_THRESHOLD = 180
 VERY_HIGH_THRESHOLD = 250
 
+MAX_GAP_MINUTES = 30
+
 
 def parse_number(value):
     if pd.isna(value):
@@ -50,7 +52,8 @@ def load_libreview_data(file_path: Path) -> pd.DataFrame:
 
 def get_glucose_readings(df: pd.DataFrame) -> pd.DataFrame:
     glucose = df[df["glucose_mg_dl"].notna()].copy()
-    return glucose[["timestamp", "glucose_mg_dl"]].sort_values("timestamp")
+    glucose = glucose[["timestamp", "glucose_mg_dl"]]
+    return glucose.sort_values("timestamp")
 
 
 def get_insulin_doses(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,6 +69,70 @@ def get_insulin_doses(df: pd.DataFrame) -> pd.DataFrame:
 
     insulin = pd.concat([rapid, basal], ignore_index=True)
     return insulin.sort_values("timestamp")
+
+
+def classify_glucose_range(value: float) -> str:
+    if value < VERY_LOW_THRESHOLD:
+        return "very_low"
+    if value < LOW_THRESHOLD:
+        return "low"
+    if value <= HIGH_THRESHOLD:
+        return "in_range"
+    if value <= VERY_HIGH_THRESHOLD:
+        return "high"
+    return "very_high"
+
+
+def calculate_time_weighted_ranges(day_glucose: pd.DataFrame) -> dict:
+    day_glucose = day_glucose.sort_values("timestamp").copy()
+
+    day_glucose["next_timestamp"] = day_glucose["timestamp"].shift(-1)
+    day_glucose["delta_minutes"] = (
+        day_glucose["next_timestamp"] - day_glucose["timestamp"]
+    ).dt.total_seconds() / 60
+
+    valid_intervals = day_glucose[
+        day_glucose["delta_minutes"].notna()
+        & (day_glucose["delta_minutes"] > 0)
+        & (day_glucose["delta_minutes"] <= MAX_GAP_MINUTES)
+    ].copy()
+
+    ignored_intervals = day_glucose[
+        day_glucose["delta_minutes"].notna()
+        & (day_glucose["delta_minutes"] > MAX_GAP_MINUTES)
+    ].copy()
+
+    minutes = {
+        "very_low_minutes": 0.0,
+        "low_minutes": 0.0,
+        "in_range_minutes": 0.0,
+        "high_minutes": 0.0,
+        "very_high_minutes": 0.0,
+    }
+
+    for _, row in valid_intervals.iterrows():
+        glucose_range = classify_glucose_range(row["glucose_mg_dl"])
+        key = f"{glucose_range}_minutes"
+        minutes[key] += row["delta_minutes"]
+
+    covered_minutes = sum(minutes.values())
+    ignored_gap_minutes = ignored_intervals["delta_minutes"].sum()
+
+    def percent(value):
+        if covered_minutes == 0:
+            return 0
+        return value / covered_minutes * 100
+
+    return {
+        **minutes,
+        "covered_minutes": covered_minutes,
+        "ignored_gap_minutes": ignored_gap_minutes,
+        "very_low_time_percent": percent(minutes["very_low_minutes"]),
+        "low_time_percent": percent(minutes["low_minutes"]),
+        "in_range_time_percent": percent(minutes["in_range_minutes"]),
+        "high_time_percent": percent(minutes["high_minutes"]),
+        "very_high_time_percent": percent(minutes["very_high_minutes"]),
+    }
 
 
 def calculate_daily_summary(df: pd.DataFrame, date: str) -> dict:
@@ -89,6 +156,8 @@ def calculate_daily_summary(df: pd.DataFrame, date: str) -> dict:
     high = ((values > HIGH_THRESHOLD) & (values <= VERY_HIGH_THRESHOLD)).sum()
     very_high = (values > VERY_HIGH_THRESHOLD).sum()
 
+    time_weighted = calculate_time_weighted_ranges(day_glucose)
+
     rapid_doses = day_insulin[day_insulin["type"] == "RAPID"]
     basal_doses = day_insulin[day_insulin["type"] == "BASAL"]
 
@@ -99,6 +168,8 @@ def calculate_daily_summary(df: pd.DataFrame, date: str) -> dict:
         "min_glucose": values.min(),
         "max_glucose": values.max(),
         "std_glucose": values.std(),
+
+        # Reading-based ranges
         "very_low_readings": very_low,
         "low_readings": low,
         "in_range_readings": in_range,
@@ -109,12 +180,27 @@ def calculate_daily_summary(df: pd.DataFrame, date: str) -> dict:
         "in_range_percent": in_range / total_readings * 100,
         "high_percent": high / total_readings * 100,
         "very_high_percent": very_high / total_readings * 100,
+
+        # Time-weighted ranges
+        **time_weighted,
+
+        # Insulin
         "rapid_dose_count": len(rapid_doses),
         "rapid_units_total": rapid_doses["units"].sum() if not rapid_doses.empty else 0,
         "basal_dose_count": len(basal_doses),
         "basal_units_total": basal_doses["units"].sum() if not basal_doses.empty else 0,
         "insulin_doses": day_insulin,
     }
+
+
+def format_minutes(minutes: float) -> str:
+    hours = int(minutes // 60)
+    mins = int(round(minutes % 60))
+
+    if hours == 0:
+        return f"{mins} min"
+
+    return f"{hours} h {mins} min"
 
 
 def print_summary(summary: dict):
@@ -130,13 +216,39 @@ def print_summary(summary: dict):
     print(f"Maximum: {summary['max_glucose']:.0f} mg/dL")
     print(f"Standard deviation: {summary['std_glucose']:.2f} mg/dL")
 
-    print("\nRanges")
-    print("------")
+    print("\nRanges by number of readings")
+    print("----------------------------")
     print(f"Very low (<54): {summary['very_low_percent']:.2f}% ({summary['very_low_readings']} readings)")
     print(f"Low (54-69): {summary['low_percent']:.2f}% ({summary['low_readings']} readings)")
     print(f"In range (70-180): {summary['in_range_percent']:.2f}% ({summary['in_range_readings']} readings)")
     print(f"High (181-250): {summary['high_percent']:.2f}% ({summary['high_readings']} readings)")
     print(f"Very high (>250): {summary['very_high_percent']:.2f}% ({summary['very_high_readings']} readings)")
+
+    print("\nTime-weighted ranges")
+    print("--------------------")
+    print(f"Covered time: {format_minutes(summary['covered_minutes'])}")
+    print(f"Ignored gaps: {format_minutes(summary['ignored_gap_minutes'])}")
+
+    print(
+        f"Very low (<54): {summary['very_low_time_percent']:.2f}% "
+        f"({format_minutes(summary['very_low_minutes'])})"
+    )
+    print(
+        f"Low (54-69): {summary['low_time_percent']:.2f}% "
+        f"({format_minutes(summary['low_minutes'])})"
+    )
+    print(
+        f"In range (70-180): {summary['in_range_time_percent']:.2f}% "
+        f"({format_minutes(summary['in_range_minutes'])})"
+    )
+    print(
+        f"High (181-250): {summary['high_time_percent']:.2f}% "
+        f"({format_minutes(summary['high_minutes'])})"
+    )
+    print(
+        f"Very high (>250): {summary['very_high_time_percent']:.2f}% "
+        f"({format_minutes(summary['very_high_minutes'])})"
+    )
 
     print("\nInsulin")
     print("-------")
