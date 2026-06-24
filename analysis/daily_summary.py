@@ -12,6 +12,7 @@ HIGH_THRESHOLD = 180
 VERY_HIGH_THRESHOLD = 250
 
 MAX_GAP_MINUTES = 30
+MINUTES_PER_DAY = 24 * 60
 
 
 def parse_number(value):
@@ -83,6 +84,16 @@ def classify_glucose_range(value: float) -> str:
     return "very_high"
 
 
+def classify_data_quality(coverage_percent: float) -> str:
+    if coverage_percent >= 90:
+        return "COMPLETE"
+    if coverage_percent >= 70:
+        return "ACCEPTABLE"
+    if coverage_percent >= 40:
+        return "PARTIAL"
+    return "LOW_COVERAGE"
+
+
 def calculate_time_weighted_ranges(day_glucose: pd.DataFrame) -> dict:
     day_glucose = day_glucose.sort_values("timestamp").copy()
 
@@ -118,6 +129,9 @@ def calculate_time_weighted_ranges(day_glucose: pd.DataFrame) -> dict:
     covered_minutes = sum(minutes.values())
     ignored_gap_minutes = ignored_intervals["delta_minutes"].sum()
 
+    coverage_percent = covered_minutes / MINUTES_PER_DAY * 100
+    data_quality = classify_data_quality(coverage_percent)
+
     def percent(value):
         if covered_minutes == 0:
             return 0
@@ -127,12 +141,15 @@ def calculate_time_weighted_ranges(day_glucose: pd.DataFrame) -> dict:
         **minutes,
         "covered_minutes": covered_minutes,
         "ignored_gap_minutes": ignored_gap_minutes,
+        "coverage_percent": coverage_percent,
+        "data_quality": data_quality,
         "very_low_time_percent": percent(minutes["very_low_minutes"]),
         "low_time_percent": percent(minutes["low_minutes"]),
         "in_range_time_percent": percent(minutes["in_range_minutes"]),
         "high_time_percent": percent(minutes["high_minutes"]),
         "very_high_time_percent": percent(minutes["very_high_minutes"]),
-    }
+}
+    
 
 
 def calculate_daily_summary(df: pd.DataFrame, date: str) -> dict:
@@ -224,10 +241,15 @@ def print_summary(summary: dict):
     print(f"High (181-250): {summary['high_percent']:.2f}% ({summary['high_readings']} readings)")
     print(f"Very high (>250): {summary['very_high_percent']:.2f}% ({summary['very_high_readings']} readings)")
 
-    print("\nTime-weighted ranges")
-    print("--------------------")
+    print("\nDay coverage")
+    print("------------")
     print(f"Covered time: {format_minutes(summary['covered_minutes'])}")
     print(f"Ignored gaps: {format_minutes(summary['ignored_gap_minutes'])}")
+    print(f"Coverage: {summary['coverage_percent']:.2f}%")
+    print(f"Data quality: {summary['data_quality']}")
+
+    print("\nTime-weighted ranges")
+    print("--------------------")
 
     print(
         f"Very low (<54): {summary['very_low_time_percent']:.2f}% "
